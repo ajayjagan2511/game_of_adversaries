@@ -1,7 +1,6 @@
 import torch
 
 class DeepFoolAttack:
-    # unchanged logic, just moved
     def __init__(self, steps, overshoot=0.02):
         self.steps     = steps
         self.overshoot = overshoot

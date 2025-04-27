@@ -1,7 +1,6 @@
-# Adversarial-Attack Ablation Study
+# Game Of Adversaries
 
-This repository reproduces a systematic study of **embedding-space adversarial attacks** on NLP models.  
-The original monolithic script (`ablation_multi.py`) has been **split into a clean, importable package** while preserving every line of computational logic.
+This repository cotains the code for a systematic study of **embedding-space adversarial attacks** on two SST-2 sentiment classifiers (a HuggingFace DistilBERT model and a TextAttack LSTM). It generates adversarial examples in embedding space via each attack/loss/penalty combo, measures attack success rates (ASR), and prints a summary table of ASR (%) for every configuration and measures the semantic similarity using a LLM judge (GPT-2).
 
 ---
 
@@ -16,37 +15,72 @@ Perturbations are performed **directly in embedding space**; the input text itse
 ---
 
 ## 2 · Problem Statement & Methods
-For a correctly classified sentence \(\mathbf{x}\) with label \(y\), we seek a minimal perturbation \(\delta\) in hidden-state space such that  
+For a correctly classified sentence, we seek a minimal perturbation in hidden-state space such that the it leads to missclassication.
 
-\[
-\arg\max f(\mathbf{h}+\delta)=1-y,
-\]
 
-where \(f\) is the classifier head and \(\mathbf{h}\) is the clean embedding.
-
-We sweep:
+We cover:
 
 | **Dimension** | **Values** |
 |---------------|------------|
-| **Attack**    | Rotation [^1], PGD, DeepFool |
-| **Loss**      | Cross-Entropy (CE), Triplet, Carlini–Wagner (CW) |
+| **Attack**    | Rotation, PGD, DeepFool |
+| **Loss**      | Cross-Entropy (CE), Carlini–Wagner (CW) |
 | **Penalty**   | KL, L<sub>2</sub>, Cosine |
 | **Model**     | DistilBERT, LSTM |
 
-[^1]: *RotationAttack* learns two orthogonal axes \(\mathbf{u},\mathbf{v}\) and a rotation angle \(\theta\) inside their span.
+For each **successful** adversarial example we query an auxiliary language model (GPT-2) asking it to rate the similarity between original and perturbed embedded and find the average for each combination.
+
 
 ---
 
 ## 3 · Directory Layout
 
 
+```text
+adv-attacks-ablation/
+├── README.md
+├── requirements.txt
+├── LICENSE
+│
+│
+├── src/                    
+│   ├── __init__.py
+│   ├── config.py           
+│   ├── runner.py           # main experiment loop
+│   │
+│   ├── judge.py            # GPT-2 semantic-similarity scorer
+│   │
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── distilbert.py
+│   │   └── lstm.py
+│   │
+│   ├── attacks/
+│   │   ├── __init__.py
+│   │   ├── rotation.py
+│   │   ├── pgd.py
+│   │   └── deepfool.py
+│   │
+│   ├── losses/
+│   │   ├── __init__.py     # loss_map
+│   │   ├── ce.py
+│   │   ├── triplet.py
+│   │   └── cw.py
+│   │
+│   └── penalties/
+│       ├── __init__.py     # pen_map
+│       ├── kl.py
+│       ├── l2.py
+│       └── cosine.py
+│
+└── ablation_multi.py      
+```
 
 ---
 
 ## 4 · Installation
 ```bash
-git clone https://github.com/<your-handle>/adv-attacks-ablation.git
-cd adv-attacks-ablation
+git clone https://github.com/ajayjagan2511/game_of_adversaries.git
+cd game_of_adversaries
 python -m venv .venv && source .venv/bin/activate   # or conda env create
 pip install -r requirements.txt
 ```
@@ -70,7 +104,7 @@ python ablation_multi.py \
   --deepfool_steps 1000
 ```
 
-###5.2 LSTM sweep
+### 5.2 LSTM sweep
 ```bash
 python ablation_multi.py \
   --models LSTM \
@@ -95,6 +129,9 @@ DistilBERT   | Rotation | CE      | KL       | 8          | 42.00
 Released under the MIT License (see LICENSE).
 
 ## 8 · Acknowledgments
+
+Dr. Kuan-Hao Huang, Texas A&M University
+
 Hugging Face Transformers & Datasets
 
 TextAttack LSTM SST-2 baseline
