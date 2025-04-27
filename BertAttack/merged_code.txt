@@ -1,0 +1,706 @@
+
+# ===== File: ./config.py =====
+
+# config.py
+# Global configuration parameters for the adversarial attack project
+
+TOP_K = 5  # Number of top important words to consider for attack
+MIN_COSINE_THRESHOLD_WORD = 0.0  # Minimum cosine similarity for word-level semantic preservation
+MIN_COSINE_THRESHOLD_SENTENCE = 0.0  # Minimum cosine similarity for sentence-level semantic preservation
+MAX_WORD_PERTURBATION_PERCENT = 1.0  # Maximum percentage of words allowed to be perturbed
+M_ATTEMPTS = 5  # Maximum attempts for generating a new attack vector if stored ones fail
+DIRECTIONAL_THRESHOLD = 0.0  # Minimum required directional effectiveness (placeholder value)
+
+# Model names and paths:
+MLM_MODEL_NAME = "bert-base-uncased"
+SENTIMENT_MODEL_NAME = "distilbert-base-uncased-finetuned-sst-2-english"
+
+
+
+# ===== File: ./evaluation_imdb.py =====
+
+#!/usr/bin/env python3
+import random
+from datasets import load_dataset
+from config import TOP_K
+from modules import word_importance, directional_replacement, storage_manager, constraints_checker
+from models import classifier, mlm, pos_tagger
+
+# Initialize models and storage
+clf = classifier.SentimentClassifier()
+mlm_model = mlm.MLM()
+ptagger = pos_tagger.POSTagger()
+storage = storage_manager.StorageManager()
+
+def run_attack(sentence: str, target_label: str):
+    print(f"\nOriginal Sentence: {sentence}")
+    original_prediction = clf.predict(sentence)[0]
+    print(f"Original Prediction: {original_prediction}")
+    words = sentence.split()
+    important_words = word_importance.get_important_words(sentence, clf, top_k=TOP_K)
+    modifications = 0
+    adversarial_sentence = words.copy()
+    for item in important_words:
+        index = item["index"]
+        original_word = item["word"]
+        # Try to use a stored attack vector first
+        stored_vectors = storage.retrieve_attack_vector(original_word)
+        new_candidate = None
+        if stored_vectors:
+            new_candidate = stored_vectors[0]["replacement"]
+            print(f"Using stored vector for '{original_word}' -> '{new_candidate}'")
+        else:
+            new_candidate = directional_replacement.get_directional_replacement(
+                sentence, index, target_label, clf, mlm_model, ptagger)
+            if new_candidate:
+                storage.store_attack_vector({
+                    "original_word": original_word,
+                    "context_index": index,
+                    "replacement": new_candidate,
+                    "direction_vector": None,
+                    "magnitude": None,
+                    "features": {"pos": ptagger.get_pos_from_sentence(sentence, index)}
+                })
+        if new_candidate and constraints_checker.check_pos_preservation(words[index], new_candidate, ptagger) and \
+           constraints_checker.check_word_semantic_similarity(words[index], new_candidate):
+            adversarial_sentence[index] = new_candidate
+            modifications += 1
+            print(f"Replaced '{original_word}' with '{new_candidate}' at index {index}")
+        if modifications / len(words) > __import__('config').config.MAX_WORD_PERTURBATION_PERCENT:
+            print("Maximum perturbation reached.")
+            break
+    final_sentence = " ".join(adversarial_sentence)
+    final_prediction = clf.predict(final_sentence)[0]
+    print(f"\nAdversarial Sentence: {final_sentence}")
+    print(f"Final Prediction: {final_prediction}")
+
+if __name__ == "__main__":
+    # Load 50 samples from the IMDb test set for quick evaluation
+    dataset = load_dataset("imdb", split="test[:50]")
+    for data in dataset:
+        sentence = data["text"].replace("\n", " ").strip()
+        original = clf.predict(sentence)[0]["label"]
+        target = "NEGATIVE" if original == "POSITIVE" else "POSITIVE"
+        run_attack(sentence, target)
+
+
+
+# ===== File: ./evaluation_storage_only.py =====
+
+#!/usr/bin/env python3
+from datasets import load_dataset
+from config import TOP_K
+from modules import word_importance, storage_manager, constraints_checker
+from models import classifier, pos_tagger
+
+# This evaluation focuses solely on reusing stored attacks.
+clf = classifier.SentimentClassifier()
+ptagger = pos_tagger.POSTagger()
+storage = storage_manager.StorageManager()
+
+def run_storage_only_attack(sentence: str, target_label: str):
+    print(f"\nOriginal Sentence: {sentence}")
+    original_prediction = clf.predict(sentence)[0]
+    print(f"Original Prediction: {original_prediction}")
+    words = sentence.split()
+    important_words = word_importance.get_important_words(sentence, clf, top_k=TOP_K)
+    modifications = 0
+    adversarial_sentence = words.copy()
+    for item in important_words:
+        index = item["index"]
+        original_word = item["word"]
+        stored_vectors = storage.retrieve_attack_vector(original_word)
+        if stored_vectors:
+            new_candidate = stored_vectors[0]["replacement"]
+            if constraints_checker.check_pos_preservation(words[index], new_candidate, ptagger) and \
+               constraints_checker.check_word_semantic_similarity(words[index], new_candidate):
+                adversarial_sentence[index] = new_candidate
+                modifications += 1
+                print(f"Replaced '{original_word}' with '{new_candidate}' using storage at index {index}")
+        else:
+            print(f"No stored vector for '{original_word}' - skipping.")
+        if modifications / len(words) > __import__('config').config.MAX_WORD_PERTURBATION_PERCENT:
+            print("Maximum perturbation reached.")
+            break
+    final_sentence = " ".join(adversarial_sentence)
+    final_prediction = clf.predict(final_sentence)[0]
+    print(f"\nAdversarial Sentence (Storage-only): {final_sentence}")
+    print(f"Final Prediction: {final_prediction}")
+
+if __name__ == "__main__":
+    # Load 50 samples from the SST-2 validation set for evaluation
+    dataset = load_dataset("glue", "sst2", split="validation[:50]")
+    for data in dataset:
+        sentence = data["sentence"].strip()
+        original = clf.predict(sentence)[0]["label"]
+        target = "NEGATIVE" if original == "POSITIVE" else "POSITIVE"
+        run_storage_only_attack(sentence, target)
+
+
+
+# ===== File: ./utils/text_utils.py =====
+
+"""
+text_utils.py
+
+Provides helper functions for text manipulation.
+"""
+
+def mask_word(sentence: str, index: int, mask_token: str = "[MASK]") -> str:
+    """
+    Returns the sentence after replacing the word at the given index with the mask token.
+    """
+    words = sentence.split()
+    if index < 0 or index >= len(words):
+        return sentence
+    words[index] = mask_token
+    return " ".join(words)
+
+
+
+# ===== File: ./utils/embeddings.py =====
+
+"""
+embeddings.py
+
+Provides utilities for computing embeddings and cosine similarities.
+Uses SentenceTransformers for embedding generation.
+"""
+
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+# Load the embedding model once globally
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+def get_embedding(text: str) -> np.ndarray:
+    """
+    Returns the embedding vector for the given text.
+    """
+    emb = embedding_model.encode(text)
+    return np.array(emb)
+
+def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
+    """
+    Computes the cosine similarity between two vectors.
+    """
+    dot_product = np.dot(vec1, vec2)
+    norm_product = np.linalg.norm(vec1) * np.linalg.norm(vec2) + 1e-8
+    return dot_product / norm_product
+
+
+
+# ===== File: ./utils/init.py =====
+
+# utils/__init__.py
+# Makes the utils folder a package.
+
+from . import embeddings
+from . import text_utils
+
+
+
+# ===== File: ./models/classifier.py =====
+
+"""
+classifier.py
+
+Wrapper for a sentiment classifier using the Hugging Face transformers pipeline.
+"""
+
+from transformers import pipeline
+from config import SENTIMENT_MODEL_NAME
+
+class SentimentClassifier:
+    def __init__(self, model_name: str = None):
+        if model_name is None:
+            model_name = SENTIMENT_MODEL_NAME
+        self.model = pipeline("sentiment-analysis", model=model_name)
+
+    def predict(self, sentence: str) -> list:
+        """
+        Returns a list of predictions.
+        Each prediction is a dict with keys 'label' and 'score'.
+        """
+        prediction = self.model(sentence)
+        return prediction
+
+
+
+# ===== File: ./models/mlm.py =====
+
+"""
+mlm.py
+
+Wrapper for a masked language model (MLM) using the fill-mask pipeline.
+"""
+
+from transformers import pipeline
+from config import MLM_MODEL_NAME
+
+class MLM:
+    def __init__(self, mlm_model_name: str = None):
+        if mlm_model_name is None:
+            mlm_model_name = MLM_MODEL_NAME
+        self.model = pipeline("fill-mask", model=mlm_model_name)
+        self.mask_token = self.model.tokenizer.mask_token
+
+    def get_mask_candidates(self, sentence: str, index: int):
+        """
+        Masks the word at the given index and returns a list of candidate token predictions.
+        Each candidate is a tuple (token_str, score).
+        """
+        words = sentence.split()
+        if index < 0 or index >= len(words):
+            return []
+        words[index] = self.mask_token
+        masked_sentence = " ".join(words)
+        try:
+            predictions = self.model(masked_sentence)
+        except Exception as e:
+            print(f"MLM error: {e}")
+            return []
+        candidates = []
+        for pred in predictions:
+            token_str = pred["token_str"].strip()
+            score = pred["score"]
+            candidates.append((token_str, score))
+        return candidates
+
+
+
+# ===== File: ./models/pos_tagger.py =====
+
+"""
+pos_tagger.py
+
+Uses spaCy to perform part-of-speech tagging.
+"""
+
+import spacy
+
+class POSTagger:
+    def __init__(self):
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            from spacy.cli import download
+            download("en_core_web_sm")
+            self.nlp = spacy.load("en_core_web_sm")
+
+    def get_pos_from_sentence(self, sentence: str, index: int) -> str:
+        """
+        Returns the POS tag of the word at the given index in the sentence.
+        """
+        doc = self.nlp(sentence)
+        if index < 0 or index >= len(doc):
+            return ""
+        return doc[index].pos_
+
+    def get_pos(self, word: str) -> str:
+        """
+        Returns the POS tag for a single word.
+        """
+        doc = self.nlp(word)
+        if doc:
+            return doc[0].pos_
+        return ""
+
+
+
+# ===== File: ./models/init.py =====
+
+# models/__init__.py
+# Makes the models folder a package.
+
+from . import classifier
+from . import mlm
+from . import pos_tagger
+
+
+
+# ===== File: ./main.py =====
+
+#!/usr/bin/env python3
+"""
+main.py
+
+This script runs the adversarial text attack pipeline:
+  1. Identify the most important words (Phase 1).
+  2. Generate context-aware, directional replacements (Phase 2) using up to M_ATTEMPTS tries 
+     per word until the candidate either changes the predicted sentiment or exhausts all attempts.
+  3. Store and reuse successful attack vectors (Phase 3).
+
+When a replacement candidate is found that successfully flips the sentiment,
+the algorithm immediately updates & exits, returning the new sentence.
+"""
+
+import config
+from config import (
+    TOP_K,
+    MIN_COSINE_THRESHOLD_WORD,
+    MIN_COSINE_THRESHOLD_SENTENCE,  # (if needed for sentence-level checks)
+    MAX_WORD_PERTURBATION_PERCENT,
+    M_ATTEMPTS,
+    DIRECTIONAL_THRESHOLD,
+    MLM_MODEL_NAME,
+    SENTIMENT_MODEL_NAME,
+)
+from modules import word_importance, directional_replacement, storage_manager, constraints_checker
+from models import classifier, mlm, pos_tagger
+
+# Initialize models and storage using configuration parameters
+print("Initializing models ...")
+clf = classifier.SentimentClassifier(model_name=SENTIMENT_MODEL_NAME)  # Sentiment classifier
+mlm_model = mlm.MLM(mlm_model_name=MLM_MODEL_NAME)                      # Masked Language Model
+ptagger = pos_tagger.POSTagger()
+storage = storage_manager.StorageManager()
+
+def run_attack(sentence: str, target_label: str):
+    print(f"\nOriginal Sentence: {sentence}")
+    original_prediction = clf.predict(sentence)[0]
+    print(f"Original Prediction: {original_prediction}")
+
+    # Phase 1: Word Importance Ranking using TOP_K from config
+    important_words = word_importance.get_important_words(sentence, clf, top_k=TOP_K)
+    print(f"\nTop-{TOP_K} important words (index, word, importance):")
+    for item in important_words:
+        print(item)
+
+    words = sentence.split()
+    adversarial_sentence = words.copy()
+    modifications = 0
+    found_flip = False
+
+    # Phase 2: Iterate over important words to try and find a valid candidate
+    for item in important_words:
+        index = item["index"]
+        original_word = item["word"]
+
+        # First, try to retrieve a stored candidate for this word (if any)
+        stored_candidates = storage.retrieve_attack_vector(original_word)
+        new_candidate = None
+        if stored_candidates:
+            new_candidate = stored_candidates[0]["replacement"]
+            print(f"Using stored candidate for '{original_word}': {new_candidate}")
+        else:
+            # Call the directional replacement function which will try up to M_ATTEMPTS.
+            new_candidate = directional_replacement.get_directional_replacement(
+                sentence=sentence,
+                index=index,
+                target_label=target_label,
+                clf=clf,
+                mlm_model=mlm_model,
+                ptagger=ptagger,
+                directional_threshold=DIRECTIONAL_THRESHOLD,
+                m_attempts=M_ATTEMPTS
+            )
+            if new_candidate:
+                # Store the successful candidate for future reuse.
+                storage.store_attack_vector({
+                    "original_word": original_word,
+                    "context_index": index,
+                    "replacement": new_candidate,
+                    "direction_vector": None,   # Placeholder if computed later
+                    "magnitude": None,          # Placeholder if computed later
+                    "features": {"pos": ptagger.get_pos_from_sentence(sentence, index)}
+                })
+
+        # If a candidate was found, update the sentence and check if sentiment flipped.
+        if new_candidate is not None:
+            print(f"Replacing '{original_word}' with '{new_candidate}' at index {index}.")
+            adversarial_sentence[index] = new_candidate
+
+            # Form the new sentence
+            new_sentence = " ".join(adversarial_sentence)
+            new_pred = clf.predict(new_sentence)[0]
+            print(f"New Sentence: {new_sentence}")
+            print(f"New Prediction: {new_pred}")
+
+            # If the sentiment is now flipped to the target, exit early.
+            if new_pred["label"] == target_label:
+                print(f"Sentiment flipped to {target_label}. Exiting replacement loop.")
+                found_flip = True
+                break
+
+            modifications += 1
+
+        # Optional: Control overall perturbation (this example allows full perturbation)
+        if modifications / len(words) > MAX_WORD_PERTURBATION_PERCENT:
+            print("Reached maximum allowed perturbation limit.")
+            break
+
+    final_sentence = " ".join(adversarial_sentence)
+    new_prediction = clf.predict(final_sentence)[0]
+    print(f"\nFinal Adversarial Sentence: {final_sentence}")
+    print(f"Final Prediction: {new_prediction}")
+
+    return final_sentence
+
+if __name__ == "__main__":
+    test_sentence = "The movie is not inspiring and fantastic."
+    # Determine the target sentiment by flipping the original prediction.
+    original_label = clf.predict(test_sentence)[0]["label"]
+    target = "NEGATIVE" if original_label == "POSITIVE" else "POSITIVE"
+    run_attack(test_sentence, target)
+
+
+
+# ===== File: ./modules/storage_manager.py =====
+
+"""
+storage_manager.py
+
+Implements Phase 3: Storage Mechanism Implementation.
+Stores successful attack vectors for reuse in future attacks.
+"""
+
+class StorageManager:
+    def __init__(self):
+        # Use a simple dictionary (keyed by the original word) for storage.
+        self.storage = {}
+
+    def store_attack_vector(self, attack_info: dict):
+        """
+        Store the attack vector information.
+        attack_info should contain:
+          - original_word
+          - context_index
+          - replacement
+          - direction_vector (if computed)
+          - magnitude (if computed)
+          - additional features (e.g. POS tag)
+        """
+        key = attack_info["original_word"]
+        if key not in self.storage:
+            self.storage[key] = []
+        self.storage[key].append(attack_info)
+        print(f"Stored attack vector for '{key}'.")
+
+    def retrieve_attack_vector(self, word: str):
+        """
+        Retrieve stored attack vectors for the given word.
+        For simplicity, return the list of stored vectors.
+        """
+        if word in self.storage and self.storage[word]:
+            return self.storage[word]
+        return None
+
+
+
+# ===== File: ./modules/directional_replacement.py =====
+
+"""
+directional_replacement.py
+
+Implements Phase 2: Directional Replacement Generation.
+This module uses a masked language model (MLM) to obtain candidate replacements,
+assesses their sentiment-shift direction, and selects the best candidate.
+"""
+
+import numpy as np
+from utils.embeddings import get_embedding, cosine_similarity
+
+def compute_directional_effectiveness(original_word: str, candidate_word: str, target_label: str, clf) -> float:
+    """
+    Compute a (demonstrative) directional effectiveness score.
+    This is a simplified computation based on word embeddings.
+    """
+    orig_emb = get_embedding(original_word)
+    cand_emb = get_embedding(candidate_word)
+    diff = cand_emb - orig_emb
+    direction_vector = -orig_emb if target_label.upper() == "NEGATIVE" else orig_emb
+    score = np.dot(diff, direction_vector) / (np.linalg.norm(diff) * np.linalg.norm(direction_vector) + 1e-8)
+    return score
+
+def get_directional_replacement(sentence: str, index: int, target_label: str,
+                                clf, mlm_model, ptagger, directional_threshold, m_attempts) -> str:
+    """
+    Attempts up to m_attempts to find a candidate replacement for the word at the specified index in the sentence.
+    
+    In each attempt, the function:
+      - Retrieves a fresh set of candidate tokens from the MLM.
+      - Filters candidates by ensuring:
+           a. The candidate preserves the POS tag of the original word.
+           b. The candidate's directional effectiveness is at least 'directional_threshold'.
+           c. The candidate's semantic similarity (cosine similarity with the original word) is at least MIN_COSINE_THRESHOLD_WORD.
+      - Evaluates a combined metric score: total_score = 0.5 * mlm_score + 0.3 * direction_score + 0.2 * semantic_sim.
+      - For each candidate that passes the filters, it replaces the word in the sentence and checks the classifier's output.
+      - If a candidate changed the classifier’s predicted sentiment to the target_label, it is immediately returned.
+    
+    If no candidate causes the intended sentiment change after m_attempts, the function returns None.
+    """
+    
+    from config import MIN_COSINE_THRESHOLD_WORD
+
+
+    words = sentence.split()
+    original_word = words[index]
+    original_emb = get_embedding(original_word)
+    
+    best_candidate = None
+    best_metric = -float("inf")
+    
+    for attempt in range(1, m_attempts + 1):
+        print(f"Attempt {attempt}/{m_attempts}:")
+        candidates = mlm_model.get_mask_candidates(sentence, index)
+        # For each candidate token from the MLM:
+        for candidate_token, mlm_score in candidates:
+            # Check that the candidate preserves the original word's POS.
+            # if ptagger.get_pos_from_sentence(sentence, index) != ptagger.get_pos(candidate_token):
+            #     continue
+            
+            # Compute directional effectiveness.
+            direction_score = compute_directional_effectiveness(original_word, candidate_token, target_label, clf)
+            # if direction_score < directional_threshold:
+            #     continue
+            
+            # Compute semantic similarity.
+            cand_emb = get_embedding(candidate_token)
+            semantic_sim = cosine_similarity(original_emb, cand_emb)
+            # if semantic_sim < MIN_COSINE_THRESHOLD_WORD:
+            #     continue
+            
+            # Compute combined metric score.
+            total_score = 0.5 * mlm_score + 0.3 * direction_score + 0.2 * semantic_sim
+            print(f"Candidate '{candidate_token}': mlm_score={mlm_score:.3f}, direction_score={direction_score:.3f}, "
+                  f"semantic_sim={semantic_sim:.3f}, total_score={total_score:.3f}")
+            
+            # Update best candidate if this candidate's score is higher.
+            if total_score > best_metric:
+                best_metric = total_score
+                best_candidate = candidate_token
+            
+            # Form new sentence with candidate replacement.
+            new_sentence_tokens = words.copy()
+            new_sentence_tokens[index] = candidate_token
+            new_sentence = " ".join(new_sentence_tokens)
+            new_pred = clf.predict(new_sentence)[0]
+            
+            # If the classifier's opinion has flipped to the target sentiment, return immediately.
+            if new_pred["label"] == target_label:
+                print(f"Candidate '{candidate_token}' changed sentiment to {target_label}.")
+                return candidate_token
+        
+        # for candidate_token, mlm_score in candidates:
+        #     # Check POS preservation
+        #     if ptagger.get_pos_from_sentence(sentence, index) != ptagger.get_pos(candidate_token):
+        #         print(f"Rejected '{candidate_token}' due to POS mismatch.")
+        #         continue
+
+        #     # Compute directional effectiveness
+        #     direction_score = compute_directional_effectiveness(original_word, candidate_token, target_label, clf)
+        #     if direction_score < directional_threshold:
+        #         print(f"Rejected '{candidate_token}' due to low directional effectiveness: {direction_score:.3f}")
+        #         continue
+
+        #     # Compute semantic similarity
+        #     cand_emb = get_embedding(candidate_token)
+        #     semantic_sim = cosine_similarity(original_emb, cand_emb)
+        #     if semantic_sim < MIN_COSINE_THRESHOLD_WORD:
+        #         print(f"Rejected '{candidate_token}' due to low semantic similarity: {semantic_sim:.3f}")
+        #         continue
+
+            # Log accepted candidate details
+            print(f"Accepted '{candidate_token}' with scores: mlm={mlm_score:.3f}, direction={direction_score:.3f}, similarity={semantic_sim:.3f}")
+
+    
+    # If no candidate produced a sentiment flip after m_attempts, return None.
+    print("No candidate resulted in the sentiment change after maximum attempts.")
+    return None
+
+
+
+
+# ===== File: ./modules/word_importance.py =====
+
+"""
+word_importance.py
+
+Implements Phase 1: Word Importance Ranking.
+Each word is masked in turn and the change in classifier prediction is measured.
+"""
+
+from utils.text_utils import mask_word
+
+def get_important_words(sentence: str, clf, top_k: int = 5):
+    """
+    Returns a list of the top-k words (with their index and importance score)
+    with the highest impact on the classifier’s prediction.
+    """
+    words = sentence.split()
+    original_pred = clf.predict(sentence)[0]
+    orig_score = original_pred["score"]
+
+    importance_list = []
+    for index, word in enumerate(words):
+        masked_sentence = mask_word(sentence, index)
+        new_pred = clf.predict(masked_sentence)[0]
+        # If prediction label remains the same, compute the score difference; if flipped, use full diff.
+        if new_pred["label"] == original_pred["label"]:
+            score_diff = orig_score - new_pred["score"]
+        else:
+            score_diff = orig_score
+
+        importance_list.append({
+            "index": index,
+            "word": word,
+            "importance": score_diff
+        })
+
+    # Sort words by importance score in descending order and return the top-k
+    sorted_words = sorted(importance_list, key=lambda x: x["importance"], reverse=True)
+    return sorted_words[:top_k]
+
+
+
+# ===== File: ./modules/init.py =====
+
+# modules/__init__.py
+# This file makes the modules folder a package.
+
+from . import word_importance
+from . import directional_replacement
+from . import storage_manager
+from . import constraints_checker
+
+
+
+# ===== File: ./modules/constraints_checker.py =====
+
+"""
+constraints_checker.py
+
+Provides functions to check for:
+  - Word-level semantic similarity
+  - Sentence-level semantic similarity
+  - POS preservation
+"""
+
+from utils.embeddings import get_embedding, cosine_similarity
+
+def check_word_semantic_similarity(original_word: str, candidate_word: str, threshold: float = 0.7) -> bool:
+    """
+    Check whether the candidate word is semantically similar to the original word using cosine similarity.
+    """
+    orig_emb = get_embedding(original_word)
+    cand_emb = get_embedding(candidate_word)
+    sim = cosine_similarity(orig_emb, cand_emb)
+    return sim >= threshold
+
+def check_sentence_semantic_similarity(original_sentence: str, perturbed_sentence: str, threshold: float = 0.8) -> bool:
+    """
+    Stub implementation for sentence-level semantic similarity.
+    In practice, use a sentence encoder to compute similarity.
+    """
+    return True
+
+def check_pos_preservation(original_word: str, candidate_word: str, pos_tagger) -> bool:
+    """
+    Ensures the candidate word's POS tag matches that of the original.
+    """
+    original_pos = pos_tagger.get_pos(original_word)
+    candidate_pos = pos_tagger.get_pos(candidate_word)
+    return original_pos == candidate_pos
+
+
