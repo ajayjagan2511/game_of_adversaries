@@ -120,9 +120,8 @@ python ablation_multi.py \
 ```
 
 ## 6. Results
-Model        | Attack   | Loss    | Penalty  | λ          | ASR  (%)
--------------+----------+---------+----------+------------+---------
-DistilBERT   | Rotation | CE      | KL       | 8          | 42.00
+![image](https://github.com/user-attachments/assets/977c62be-e8d3-437f-bf16-13819ee9a7ce)
+
 ...
 
 ## 7 · License
